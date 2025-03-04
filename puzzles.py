@@ -1,6 +1,8 @@
+#%%
 import argparse
 from typing import List
 import os
+os.environ['TRITON_INTERPRET']="1"
 
 import torch
 import triton
@@ -10,7 +12,7 @@ import triton.language as tl
 from display import print_end_line
 from tensor_type import Float32, Int32
 from test_puzzle import test
-
+#%%
 
 """
 # Triton Puzzles Lite
@@ -54,23 +56,23 @@ Explanation:
 tl.load(ptr, mask)
 tl.load use mask: [0 1 2 3 4 5 6 7] < 5 = [1 1 1 1 1 0 0 0]
 """
-
+#%%
 
 @triton.jit
 def demo1(x_ptr):
     range = tl.arange(0, 8)
     # print works in the interpreter
-    print(range)
+    print("range", range)
     x = tl.load(x_ptr + range, range < 5, 0)
-    print(x)
+    print("x", x)
 
 
 def run_demo1():
     print("Demo1 Output: ")
-    demo1[(1, 1, 1)](torch.ones(4, 3))
+    demo1[(1, 1, 1)](torch.ones(8))
     print_end_line()
-
-
+run_demo1()
+#%%
 """
 ### Demo 2:
 
@@ -100,11 +102,13 @@ Explanation:
 tl.load use mask: i < 4 and j < 3.
 """
 
-
+#%%
 @triton.jit
 def demo2(x_ptr):
     i_range = tl.arange(0, 8)[:, None]
     j_range = tl.arange(0, 4)[None, :]
+    print(i_range)
+    print(j_range)
     range = i_range * 4 + j_range
     # print works in the interpreter
     print(range)
@@ -117,7 +121,8 @@ def run_demo2():
     demo2[(1, 1, 1)](torch.ones(4, 4))
     print_end_line()
 
-
+run_demo2()
+#%%
 """
 ### Demo 3
 
@@ -141,7 +146,7 @@ here range < 5 corresponds to the 2D-mask
 [0. 0. 0.]]
 """
 
-
+#%%
 @triton.jit
 def demo3(z_ptr):
     range = tl.arange(0, 8)
@@ -155,6 +160,8 @@ def run_demo3():
     print(z)
     print_end_line()
 
+run_demo3()
+#%%
 
 """
 ### Demo 4
@@ -177,7 +184,7 @@ This program launch 3 blocks in parallel. For each block (pid=0, 1, 2), it loads
 elements. Note that similar to demo3, multi-dimensional tensors are flattened when we 
 use pointer (i.e. continuous in memory).
 """
-
+#%%
 
 @triton.jit
 def demo4(x_ptr):
@@ -194,6 +201,8 @@ def run_demo4():
     print_end_line()
 
 
+run_demo4()
+#%%
 r"""
 ## Puzzle 1: Constant Add
 
@@ -203,8 +212,11 @@ Block size `B0` is always the same as vector `x` with length `N0`.
 .. math::
     z_i = 10 + x_i \text{ for } i = 1\ldots N_0
 """
-
-
+#%%
+torch.set_default_device("cpu")
+device="cpu"
+print_log = True
+print_end_line()
 def add_spec(x: Float32[32,]) -> Float32[32,]:
     "This is the spec that you should implement. Uses typing to define sizes."
     return x + 10.0
@@ -215,9 +227,21 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # We name the offsets of the pointers as "off_"
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
+    x += 10
+    tl.store(z_ptr + off_x, x)
     # Finish me!
     return
 
+print("Puzzle #1:")
+ok = test(
+    add_kernel,
+    add_spec,
+    nelem={"N0": 32},
+    print_log=print_log,
+    device=device,
+)
+print_end_line()
+#%%
 
 r"""
 ## Puzzle 2: Constant Add Block
@@ -229,7 +253,7 @@ Block size `B0` is now smaller than the shape vector `x` which is `N0`.
     z_i = 10 + x_i \text{ for } i = 1\ldots N_0
 """
 
-
+#%%
 def add2_spec(x: Float32[200,]) -> Float32[200,]:
     return x + 10.0
 
@@ -237,8 +261,32 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    block_id = tl.program_id(0)
+    off_x = tl.arange(0, B0) + block_id * B0 
+    print(f"{block_id=} {N0=} {B0=} {off_x} {off_x < N0}")
+    x = tl.load(x_ptr + off_x, off_x < N0, 0)
+    x += 10 
+    tl.store(z_ptr + off_x, x, off_x < N0)
+    
+    ## 这里其实是不需要进行 stage 的 :::
+    # off_x = tl.arange(0, B0) + block_id * B0
+    # stage = (N0 + B0 - 1) // B0
+    # for i in range(stage):
+    #     x = tl.load(x_ptr + off_x + i * B0, off_x + i * B0 < N0, 0)
+    #     x += 10
+    #     tl.store(z_ptr + off_x + i * B0, x, off_x + i * B0 < N0)
     return
 
+print("Puzzle #2:")
+ok = test(
+    add_mask2_kernel,
+    add2_spec,
+    nelem={"N0": 200},
+    print_log=print_log,
+    device=device,
+)
+print_end_line()
+#%%
 
 r"""
 ## Puzzle 3: Outer Vector Add
