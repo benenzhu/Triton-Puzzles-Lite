@@ -66,9 +66,10 @@ def test(puzzle, puzzle_spec, nelem={}, B={"B0": 32}, print_log=False, device="c
         print("Spec:", z_.dtype, z_.shape, "\n", z_)
         # 设置打印选项以显示完整张量
         torch.set_printoptions(threshold=float('inf'))
-        print("Diff (True: correct, False: incorrect):", "\n", torch.isclose(z, z_))
+        if not match:
+            print("Diff (True: correct, False: incorrect):", "\n", torch.isclose(z, z_))
         # 恢复默认打印选项（可选）
-        torch.set_printoptions(threshold=1000)
+        torch.set_printoptions(threshold=5)
 
     if device == "cuda":
         print("Memory access detection is not supported on GPU. Skip checking.")
@@ -94,6 +95,11 @@ def test(puzzle, puzzle_spec, nelem={}, B={"B0": 32}, print_log=False, device="c
                 print("Invalid access mask (True: valid access, False: invalid access): \n", failures[key])
     
     return match and not failures
+
+torch.set_default_device("cpu")
+device="cpu"
+print_log = False
+print_end_line()
 #%%
 
 """
@@ -295,10 +301,6 @@ Block size `B0` is always the same as vector `x` with length `N0`.
     z_i = 10 + x_i \text{ for } i = 1\ldots N_0
 """
 #%%
-torch.set_default_device("cpu")
-device="cpu"
-print_log = True
-print_end_line()
 def add_spec(x: Float32[32,]) -> Float32[32,]:
     "This is the spec that you should implement. Uses typing to define sizes."
     return x + 10.0
@@ -446,17 +448,22 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
-    # print(block_id_x, block_id_y, N0, N1, B0, B1)  
-    off_x = tl.arange(0, B0) + block_id_x * B0
-    off_y = tl.arange(0, B1) + block_id_y * B1
-    x = tl.load(x_ptr + off_x, off_x < N0, 0)[None, :] #  [1, 90]
-    y = tl.load(y_ptr + off_y, off_y < N1, 0)[:, None] # [100, 1]
-    z = x + y
-    mask = (off_x < N0) & (off_y < N1)
-    # mask = off_y[:, None] * N0 + off_x[None, :] 这里是个错误的写法...
-    tl.store(z_ptr + mask, z, mask < N0 * N1)
+    
+    off_x = (tl.arange(0, B0) + block_id_x * B0)[None, :]
+    off_y = (tl.arange(0, B1) + block_id_y * B1)[:, None]
+    # Fix: correctly calculate the offset in linear memory for a 2D tensor
+    off_z = off_y * N0 + off_x
+    # print(f"{off_z=}")
 
-    # Finish me!
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    x = tl.load(x_ptr + off_x, mask_x, 0)
+    y = tl.load(y_ptr + off_y, mask_y, 0)
+    # print(f"{x=}{y=}")
+    mask_z = mask_y & mask_x
+    z = y + x
+    
+    tl.store(z_ptr + off_z, z, mask_z)
     return
 print("Puzzle #4:")
 ok = test(
@@ -493,8 +500,30 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    off_x = (tl.arange(0, B0) + block_id_x * B0)[None, :]
+    off_y = (tl.arange(0, B1) + block_id_y * B1)[:, None]
+    off_z = off_y * N0 + off_x
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    mask_z = mask_y & mask_x
+    x = tl.load(x_ptr + off_x, mask_x, 0)
+    y = tl.load(y_ptr + off_y, mask_y, 0)
+    z =  y * x
+    z = tl.maximum(0, z)
+    tl.store(z_ptr + off_z, z, mask_z)
+    
     # Finish me!
     return
+print("Puzzle #5:")
+ok = test(
+    mul_relu_block_kernel,
+    mul_relu_block_spec,
+    nelem={"N0": 100, "N1": 90},
+    print_log=print_log,
+    device=device,
+)
+print_end_line()
+#%%
 
 
 r"""
