@@ -11,7 +11,89 @@ import triton.language as tl
 # Local imports
 from display import print_end_line
 from tensor_type import Float32, Int32
-from test_puzzle import test
+import inspect
+import triton
+import torch
+
+from interpreter import patch, collect_grid
+
+def test(puzzle, puzzle_spec, nelem={}, B={"B0": 32}, print_log=False, device="cpu") -> bool:
+    """Test a single puzzle."""
+
+    B = dict(B)
+    if "N1" in nelem and "B1" not in B:
+        B["B1"] = 32
+    if "N2" in nelem and "B2" not in B:
+        B["B2"] = 32
+
+    torch.manual_seed(0)
+    signature = inspect.signature(puzzle_spec)
+    args = {}
+    for n, p in signature.parameters.items():
+        # print(p)
+        args[n + "_ptr"] = (p.annotation.dims, p)
+    args["z_ptr"] = (signature.return_annotation.dims, None)
+
+    tt_args = []
+    for k, (v, t) in args.items():
+        tt_args.append(torch.rand(*v, device=device) - 0.5)
+        # tt_args.append(torch.ones(*v, device=device))
+        if t is not None and t.annotation.dtype == "int32":
+            tt_args[-1] = torch.randint(-100000, 100000, v, device=device)
+
+    grid = lambda meta: (triton.cdiv(nelem["N0"], meta["B0"]),
+                         triton.cdiv(nelem.get("N1", 1), meta.get("B1", 1)),
+                         triton.cdiv(nelem.get("N2", 1), meta.get("B2", 1)))
+
+    #for k, v in args.items():
+    #    print(k, v)
+    
+    # triton_viz.trace(puzzle)[grid](*tt_args, **B, **nelem))
+    with patch():
+        puzzle[grid](*tt_args, **B, **nelem)
+    
+    z = tt_args[-1]
+    tt_args = tt_args[:-1]
+    z_ = puzzle_spec(*tt_args)
+    match = torch.allclose(z, z_, rtol=1e-3, atol=1e-3)
+    match_emoji = "✅" if match else "❌"
+    print(match_emoji, "Results match:", match)
+
+    if not match or print_log:
+        print("Launch args: ", nelem, B)
+        print("Inputs: ", tt_args)
+        print("Yours:", z.dtype, z.shape, "\n", z)
+        print("Spec:", z_.dtype, z_.shape, "\n", z_)
+        # 设置打印选项以显示完整张量
+        torch.set_printoptions(threshold=float('inf'))
+        print("Diff (True: correct, False: incorrect):", "\n", torch.isclose(z, z_))
+        # 恢复默认打印选项（可选）
+        torch.set_printoptions(threshold=1000)
+
+    if device == "cuda":
+        print("Memory access detection is not supported on GPU. Skip checking.")
+        return match
+
+    _, _, failures, access_offsets = collect_grid()
+    mem_emoji = "✅" if not failures else "❌"
+
+    if failures:
+        print(mem_emoji, "Invalid access detected! ")
+    else:
+        print(mem_emoji, "No invalid access detected.")
+    
+    if failures or print_log:
+        print("Launch args: ", nelem, B)
+        print("Inputs: ", tt_args)
+        for key, value in access_offsets.items():
+            is_invalid = key  in failures
+            valid = "✅ Valid" if not is_invalid else "❌ Invalid"
+            print(f"{valid} access in block: ", key)
+            print("Access offsets (in bytes. float32/int32=4 bytes per loc): \n", value)
+            if is_invalid:
+                print("Invalid access mask (True: valid access, False: invalid access): \n", failures[key])
+    
+    return match and not failures
 #%%
 
 """
@@ -307,9 +389,39 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
+    # 这个的结论是 triton 写的时候, 其实可以不用管 每个 program_id() 具体处理了多少数据的, 直接跳过就行, 让他自己进行分配
+    x_ptr_swap = y_ptr
+    y_ptr_swap = x_ptr
+    id = tl.program_id(0)
+    print(id)
+    off_x = tl.arange(0, 32)
+    off_y = tl.arange(0, 32)
+    x = tl.load(x_ptr_swap + off_x, off_x < N0, 0)[:, None]
+    y = tl.load(y_ptr_swap + off_x, off_y < N1, 0)[None, :]
+    z = x + y
+    mask = off_x [:, None] * 32 +  off_y[None, :]
+    # print(f"{z_ptr=}")
+    # print(f"{mask=}")
+    # print(f"{z=}")
+    tl.store(z_ptr + mask, z)
+    # print("z", z)
+    # for i in range(32):
+    #     print(x)
+    #     print(x[i])
+    #     tl.store(z_ptr + i * 32, x[i] + y)
     # Finish me!
     return
+print("Puzzle #3:")
+ok = test(
+    add_vec_kernel,
+    add_vec_spec,
+    nelem={"N0": 32, "N1": 32},
+    print_log=print_log,
+    device=device,
+)
+print_end_line()
 
+#%%
 
 r"""
 ## Puzzle 4: Outer Vector Add Block
@@ -322,7 +434,7 @@ Block size `B1` is always less than vector `y` length `N1`.
 .. math::
     z_{j, i} = x_i + y_j\text{ for } i = 1\ldots N_0,\ j = 1\ldots N_1
 """
-
+#%%
 
 def add_vec_block_spec(x: Float32[100,], y: Float32[90,]) -> Float32[90, 100]:
     return x[None, :] + y[:, None]
@@ -334,8 +446,28 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    # print(block_id_x, block_id_y, N0, N1, B0, B1)  
+    off_x = tl.arange(0, B0) + block_id_x * B0
+    off_y = tl.arange(0, B1) + block_id_y * B1
+    x = tl.load(x_ptr + off_x, off_x < N0, 0)[None, :] #  [1, 90]
+    y = tl.load(y_ptr + off_y, off_y < N1, 0)[:, None] # [100, 1]
+    z = x + y
+    mask = (off_x < N0) & (off_y < N1)
+    # mask = off_y[:, None] * N0 + off_x[None, :] 这里是个错误的写法...
+    tl.store(z_ptr + mask, z, mask < N0 * N1)
+
     # Finish me!
     return
+print("Puzzle #4:")
+ok = test(
+    add_vec_block_kernel,
+    add_vec_block_spec,
+    nelem={"N0": 100, "N1": 90},
+    print_log=print_log,
+    device=device,
+)
+print_end_line()
+#%%
 
 
 r"""
